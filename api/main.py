@@ -33,28 +33,26 @@ async def analyze_sip(file: UploadFile = File(...)):
         raise HTTPException(400, "Only pcap/pcapng files supported")
 
     job_id = str(uuid.uuid4())
+
+    # 1️⃣ Read file ONCE
     file_bytes = await file.read()
 
-    # ✅ 1. Create temp file FIRST
+    # 2️⃣ Upload to Supabase Storage (NO tmp_path needed)
+    bucket_path = f"{job_id}/{file.filename}"
+    supabase.storage().from_("pcap").upload(
+        bucket_path,
+        file_bytes,
+        file_options={"content-type": "application/octet-stream"}
+    )
+
+    # 3️⃣ Create temp file ONLY for tshark
     with tempfile.NamedTemporaryFile(delete=False, suffix=file.filename) as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
 
-    bucket_path = f"{job_id}/{file.filename}"
-
     try:
-        # ✅ 2. Upload to Supabase using temp file
-        with open(tmp_path, "rb") as f:
-            supabase.storage().from_("pcap").upload(
-                bucket_path,
-                f,
-                file_options={"content-type": "application/octet-stream"}
-            )
-
-        # ✅ 3. Run tshark analysis
         result = analyze_sip_pcap(tmp_path)
 
-        # ✅ 4. Store job
         supabase.table("pcap_jobs").insert({
             "id": job_id,
             "filename": file.filename,
@@ -63,15 +61,8 @@ async def analyze_sip(file: UploadFile = File(...)):
         }).execute()
 
         enriched_calls = []
-
-        # ✅ 5. Store calls + AI
         for call in result:
-            try:
-                ai_explanation = explain_call(call)
-            except Exception:
-                ai_explanation = "AI explanation unavailable"
-
-            call["ai_explanation"] = ai_explanation
+            call["ai_explanation"] = explain_call(call)
             enriched_calls.append(call)
 
             supabase.table("sip_calls").insert({
@@ -82,7 +73,7 @@ async def analyze_sip(file: UploadFile = File(...)):
                 "reason": call["reason"],
                 "root_cause": call["root_cause"],
                 "events": call["events"],
-                "ai_explanation": ai_explanation
+                "ai_explanation": call["ai_explanation"]
             }).execute()
 
         return {
@@ -95,6 +86,7 @@ async def analyze_sip(file: UploadFile = File(...)):
 
     finally:
         os.remove(tmp_path)
+
 
 class ChatRequest(BaseModel):
     question: str
