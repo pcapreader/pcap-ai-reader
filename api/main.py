@@ -1,26 +1,27 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import tempfile
 import os
 import uuid
 import dotenv
+
 dotenv.load_dotenv()
+
 from sip_engine import analyze_sip_pcap
 from db import supabase
 from ai_explainer import explain_call
 from chat_engine import chat_about_job
-from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000", "https://your-vercel-ui.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 @app.get("/health")
 def health():
@@ -29,33 +30,31 @@ def health():
 @app.post("/analyze/sip")
 async def analyze_sip(file: UploadFile = File(...)):
     if not file.filename.endswith((".pcap", ".pcapng")):
-        raise HTTPException(
-            status_code=400,
-            detail="Only pcap/pcapng files supported"
-        )
+        raise HTTPException(400, "Only pcap/pcapng files supported")
 
     job_id = str(uuid.uuid4())
-
-    # 🔹 NEW: read file once
     file_bytes = await file.read()
 
-    # 🔹 NEW: upload to Supabase bucket
-    bucket_path = f"{job_id}/{file.filename}"
-    supabase.storage().from_("pcap").upload(
-        bucket_path,
-        file_bytes
-    )
-
-    # 🔹 NEW: temp file only for tshark
+    # ✅ 1. Create temp file FIRST
     with tempfile.NamedTemporaryFile(delete=False, suffix=file.filename) as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
 
+    bucket_path = f"{job_id}/{file.filename}"
+
     try:
-        # 1. Run deterministic SIP analysis
+        # ✅ 2. Upload to Supabase using temp file
+        with open(tmp_path, "rb") as f:
+            supabase.storage().from_("pcap").upload(
+                bucket_path,
+                f,
+                file_options={"content-type": "application/octet-stream"}
+            )
+
+        # ✅ 3. Run tshark analysis
         result = analyze_sip_pcap(tmp_path)
 
-        # 2. Store PCAP job (with bucket path)
+        # ✅ 4. Store job
         supabase.table("pcap_jobs").insert({
             "id": job_id,
             "filename": file.filename,
@@ -65,7 +64,7 @@ async def analyze_sip(file: UploadFile = File(...)):
 
         enriched_calls = []
 
-        # 3. Store SIP calls + AI explanation
+        # ✅ 5. Store calls + AI
         for call in result:
             try:
                 ai_explanation = explain_call(call)
@@ -86,7 +85,6 @@ async def analyze_sip(file: UploadFile = File(...)):
                 "ai_explanation": ai_explanation
             }).execute()
 
-        # 4. Return enriched response
         return {
             "job_id": job_id,
             "file": file.filename,
@@ -97,23 +95,15 @@ async def analyze_sip(file: UploadFile = File(...)):
 
     finally:
         os.remove(tmp_path)
-from pydantic import BaseModel
 
 class ChatRequest(BaseModel):
     question: str
 
-
 @app.post("/chat/{job_id}")
 async def chat(job_id: str, payload: ChatRequest):
-    question = payload.question
-
-    if not question:
-        raise HTTPException(status_code=400, detail="Question is required")
-
-    answer = chat_about_job(job_id, question)
-
+    answer = chat_about_job(job_id, payload.question)
     return {
         "job_id": job_id,
-        "question": question,
+        "question": payload.question,
         "answer": answer
     }
