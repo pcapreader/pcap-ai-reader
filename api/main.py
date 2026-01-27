@@ -43,8 +43,7 @@ async def analyze_sip(file: UploadFile = File(...)):
     bucket_path = f"{job_id}/{file.filename}"
     supabase.storage().from_("pcap").upload(
         bucket_path,
-        file_bytes,
-        file_options={"content-type": "application/octet-stream"}
+        file_bytes
     )
 
     # 🔹 NEW: temp file only for tshark
