@@ -23,12 +23,13 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
-        "https://your-vercel-ui.vercel.app"
+        "https://pcap-ai-reader-bsnl2629b-suyash-s-projects-8ce6a92c.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # -------------------------
 # Health Check
