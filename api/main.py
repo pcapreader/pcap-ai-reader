@@ -5,6 +5,7 @@ import tempfile
 import os
 import uuid
 import dotenv
+PCAP_PARSE_MODE = os.getenv("PCAP_PARSE_MODE", "demo")
 
 dotenv.load_dotenv()
 
@@ -73,11 +74,11 @@ async def analyze_sip(file: UploadFile = File(...)):
 
     try:
         # 4️⃣ Deterministic SIP analysis
-        try:
+        if PCAP_PARSE_MODE == "real":
+            # Real tshark parsing (local / prod worker)
             result = analyze_sip_pcap(tmp_path)
-        except FileNotFoundError:
-            # 🔥 DEMO MODE FALLBACK (Render has no tshark)
-            print("⚠️ tshark not found – running demo fallback")
+        else:
+            # Demo mode (Render / UI preview)
             result = [
                 {
                     "call_id": "DEMO-CALL-001",

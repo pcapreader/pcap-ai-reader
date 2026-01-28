@@ -226,5 +226,3 @@ yarn-error.log*
 .vscode/
 .idea/
 
-# ===== pcap-ui/ =====
-pcap-ui/
