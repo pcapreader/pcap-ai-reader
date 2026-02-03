@@ -226,3 +226,5 @@ yarn-error.log*
 .vscode/
 .idea/
 
+output/*.pcap
+output/*.pcapng

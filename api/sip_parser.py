@@ -1,160 +1,149 @@
-import subprocess
+import sys
 import json
+from typing import Dict, List, Any
+from tshark_runner import run_tshark
 
-#PCAP_FILE = "sip.pcapng"
+
+SIP_FIELDS = [
+    "frame.number",
+    "frame.time_relative",
+    "sip.Call-ID",
+    "sip.Method",
+    "sip.Status-Code"
+]
 
 
-def run_tshark_sip_json(pcap_file):
-    cmd = [
-        "tshark",
+# -----------------------------
+# 1️⃣ Extract SIP packets
+# -----------------------------
+def extract_sip_packets(pcap_file: str) -> List[Dict[str, Any]]:
+    args = [
         "-r", pcap_file,
         "-Y", "sip",
-        "-T", "json"
+        "-T", "fields",
+        "-E", "separator=|",
+        "-E", "occurrence=f",
     ]
-    ...
 
+    for f in SIP_FIELDS:
+        args += ["-e", f]
 
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True
-    )
+    result = run_tshark(args)
 
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr)
+    packets: List[Dict[str, Any]] = []
 
-    return json.loads(result.stdout)
+    for line in result.stdout.splitlines():
+        parts = line.split("|")
+        if len(parts) < len(SIP_FIELDS):
+            continue
 
-
-def get_first(dct, keys):
-    """Return first existing key value from dict"""
-    for k in keys:
-        if k in dct:
-            return dct[k]
-    return None
-
-
-def extract_sip_calls(packets):
-    calls = {}
-
-    for pkt in packets:
-        layers = pkt["_source"]["layers"]
-        sip = layers.get("sip", {})
-
-        # ---- Call-ID (robust) ----
-        hdr = sip.get("sip.msg_hdr_tree", {})
-        call_id = get_first(
-            hdr,
-            ["sip.Call-ID", "sip.call_id_generated"]
-        )
+        frame_no, time_rel, call_id, method, status = parts
 
         if not call_id:
             continue
 
-        # ---- Method (INVITE / BYE / ACK) ----
-        req_tree = sip.get("sip.Request-Line_tree", {})
-        method = req_tree.get("sip.Method")
-
-        # ---- Status Code (for responses) ----
-        status = get_first(
-            sip,
-            ["sip.Status-Code", "sip.Status-Line"]
-        )
-
-        # ---- Timestamp ----
-        frame = layers.get("frame", {})
-        time = frame.get("frame.time")
-
-        calls.setdefault(call_id, []).append({
-            "time": time,
-            "method": method,
-            "status": status
+        packets.append({
+            "frame": int(frame_no),
+            "time": float(time_rel),
+            "call_id": call_id.strip(),
+            "method": method or None,
+            "status": status or None
         })
+
+    return packets
+
+
+# -----------------------------
+# 2️⃣ Group packets by Call-ID
+# -----------------------------
+def extract_sip_calls(packets: List[Dict[str, Any]]) -> Dict[str, List[Dict]]:
+    calls: Dict[str, List[Dict]] = {}
+
+    for pkt in packets:
+        calls.setdefault(pkt["call_id"], []).append(pkt)
+
+    for call_id in calls:
+        calls[call_id].sort(key=lambda x: (x["time"], x["frame"]))
 
     return calls
 
-def classify_call(events):
-    methods = [e["method"] for e in events if e["method"]]
-    statuses = [e["status"] for e in events if e["status"]]
 
-    has_invite = "INVITE" in methods
-    has_ack = "ACK" in methods
-    has_200 = any("200" in s for s in statuses)
-    has_ringing = any("180" in s for s in statuses)
-    failure_status = next((s for s in statuses if any(x in s for x in ["4", "5", "6"])), None)
+# -----------------------------
+# 3️⃣ SIP failure classification (FACTS ONLY)
+# -----------------------------
+def classify_call(events: List[Dict]) -> Dict[str, Any]:
+    invite = next((e for e in events if e["method"] == "INVITE"), None)
+    ok_200 = next((e for e in events if e["status"] == "200"), None)
+    ack = next((e for e in events if e["method"] == "ACK"), None)
 
-    if has_invite and has_200 and has_ack:
-        return "SUCCESS", "Call established normally"
+    failure_status = next(
+        (e for e in events if e["status"] and e["status"].startswith(("4", "5", "6"))),
+        None
+    )
 
+    # SIP error response
     if failure_status:
-        return "FAILED_EARLY", f"SIP failure response: {failure_status}"
+        return {
+            "root_cause": f"SIP failure response {failure_status['status']}",
+            "failure_packet": failure_status["frame"]
+        }
 
-    if has_ringing and not has_200:
-        return "NO_ANSWER", "Ringing seen but no 200 OK"
+    # Missing ACK after 200 OK
+    if ok_200 and not ack:
+        return {
+            "root_cause": "ACK missing after 200 OK",
+            "failure_packet": ok_200["frame"]
+        }
 
-    if has_200 and not has_ack:
-        return "DROP_AFTER_200", "200 OK seen but ACK missing"
+    # No explicit SIP failure
+    return {
+        "root_cause": "SIP signaling completed without explicit failure",
+        "failure_packet": None
+    }
 
-    if has_invite:
-        return "INCOMPLETE", "INVITE seen but call flow incomplete"
 
-    return "UNKNOWN", "Unable to classify call"
+# -----------------------------
+# 4️⃣ Build per-call summary (MVP-1 contract)
+# -----------------------------
+def build_call_summary(call_id: str, events: List[Dict]) -> Dict[str, Any]:
+    classification = classify_call(events)
 
-def map_root_cause(outcome, reason, events):
-    statuses = [e["status"] for e in events if e["status"]]
+    invite = next((e for e in events if e["method"] == "INVITE"), None)
+    ok_200 = next((e for e in events if e["status"] == "200"), None)
 
-    if outcome == "SUCCESS":
-        return "No issue detected"
-
-    if outcome == "NO_ANSWER":
-        return "Called party did not answer (alerting without connect)"
-
-    if outcome == "DROP_AFTER_200":
-        return (
-            "ACK missing after 200 OK. Possible causes: "
-            "firewall/NAT blocking, SBC issue, packet loss, asymmetric routing"
-        )
-
-    if outcome == "FAILED_EARLY":
-        for s in statuses:
-            if "4" in s:
-                return "Client-side SIP failure (busy, forbidden, invalid number)"
-            if "5" in s:
-                return "Server/network-side failure (SBC, routing, overload)"
-            if "6" in s:
-                return "Global SIP failure (call rejected everywhere)"
-
-    if outcome == "INCOMPLETE":
-        return "Incomplete capture or signaling loss"
-
-    return "Unknown cause"
-
-def build_call_summary(call_id, events):
-    outcome, reason = classify_call(events)
-    root_cause = map_root_cause(outcome, reason, events)
+    latency = None
+    if invite and ok_200:
+        latency = round(ok_200["time"] - invite["time"], 3)
 
     return {
         "call_id": call_id,
-        "outcome": outcome,
-        "reason": reason,
-        "root_cause": root_cause,
+        "root_cause": classification["root_cause"],
+        "invite_packet": invite["frame"] if invite else None,
+        "ok_200_packet": ok_200["frame"] if ok_200 else None,
+        "failure_packet": classification.get("failure_packet"),
+        "invite_to_200_latency_sec": latency,
         "events": events
     }
 
 
-
+# -----------------------------
+# CLI test (optional)
+# -----------------------------
 def main():
-    packets = run_tshark_sip_json()
-    calls = extract_sip_calls(packets)
+    if len(sys.argv) < 2:
+        print("Usage: python sip_parser.py <pcap_file>")
+        sys.exit(1)
 
-    print(f"Total SIP calls found: {len(calls)}")
+    pcap_file = sys.argv[1]
+
+    packets = extract_sip_packets(pcap_file)
+    calls = extract_sip_calls(packets)
 
     summaries = []
     for call_id, events in calls.items():
         summaries.append(build_call_summary(call_id, events))
 
     print(json.dumps(summaries, indent=2))
-
 
 
 if __name__ == "__main__":

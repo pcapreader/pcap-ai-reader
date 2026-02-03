@@ -72,9 +72,20 @@ export default function Home() {
       {
         role: "assistant",
         content:
-          `✅ Analysis complete.\n\n` +
-          `Total calls: ${data.total_calls}\n` +
-          `You can now ask questions about this PCAP.`
+                  `✅ Analysis complete.
+
+                  📄 File overview:
+                  - Total packets: ${data.packet_stats.total_packets}
+                  - SIP packets: ${data.packet_stats.sip_packets}
+                  - RTP packets: ${data.packet_stats.rtp_packets}
+
+                  📞 Calls:
+                  - Total: ${data.total_calls}
+
+
+                  🧠 AI Insight:
+                  ${data.file_ai_insight}
+                  `+`You can now ask questions about this PCAP.`
       }
     ]);
   }
